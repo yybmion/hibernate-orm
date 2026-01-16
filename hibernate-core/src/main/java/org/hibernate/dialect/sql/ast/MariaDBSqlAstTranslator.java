@@ -113,27 +113,57 @@ public class MariaDBSqlAstTranslator<T extends JdbcOperation> extends SqlAstTran
 
 	@Override
 	protected void renderDeleteClause(DeleteStatement statement) {
-		appendSql( "delete" );
-		final Stack<Clause> clauseStack = getClauseStack();
-		try {
-			clauseStack.push( Clause.DELETE );
-			renderTableReferenceIdentificationVariable( statement.getTargetTable() );
-			if ( statement.getFromClause().getRoots().isEmpty() ) {
-				appendSql( " from " );
-				renderDmlTargetTableExpression( statement.getTargetTable() );
+		// For MariaDB < 11.1, use single-table DELETE syntax to avoid Error 1093
+		// when subqueries reference the same table (before MDEV-7487 self-join rewrite optimization)
+		// Single-table DELETE allows correlations to work without the multi-table syntax
+		if ( getDialect().getVersion().isBefore( 11, 1 )
+				&& statement.getFromClause().getRoots().isEmpty() ) {
+			// Single-table DELETE: DELETE FROM table WHERE ...
+			appendSql( "delete from " );
+			final Stack<Clause> clauseStack = getClauseStack();
+			try {
+				clauseStack.push( Clause.DELETE );
+				// Render only the table expression without alias
+				appendSql( statement.getTargetTable().getTableExpression() );
+				registerAffectedTable( statement.getTargetTable() );
 			}
-			else {
-				visitFromClause( statement.getFromClause() );
+			finally {
+				clauseStack.pop();
 			}
 		}
-		finally {
-			clauseStack.pop();
+		else {
+			// MariaDB >= 11.1 or multi-table DELETE: use standard multi-table syntax
+			appendSql( "delete" );
+			final Stack<Clause> clauseStack = getClauseStack();
+			try {
+				clauseStack.push( Clause.DELETE );
+				renderTableReferenceIdentificationVariable( statement.getTargetTable() );
+				if ( statement.getFromClause().getRoots().isEmpty() ) {
+					appendSql( " from " );
+					renderDmlTargetTableExpression( statement.getTargetTable() );
+				}
+				else {
+					visitFromClause( statement.getFromClause() );
+				}
+			}
+			finally {
+				clauseStack.pop();
+			}
 		}
 	}
 
 	@Override
 	protected void renderUpdateClause(UpdateStatement updateStatement) {
-		if ( updateStatement.getFromClause().getRoots().isEmpty() ) {
+		// For MariaDB < 11.1, use single-table UPDATE syntax to avoid Error 1093
+		// when subqueries reference the same table (before MDEV-7487 self-join rewrite optimization)
+		if ( getDialect().getVersion().isBefore( 11, 1 )
+				&& updateStatement.getFromClause().getRoots().isEmpty() ) {
+			// Single-table UPDATE: UPDATE table SET ... WHERE ...
+			appendSql( "update " );
+			appendSql( updateStatement.getTargetTable().getTableExpression() );
+			registerAffectedTable( updateStatement.getTargetTable() );
+		}
+		else if ( updateStatement.getFromClause().getRoots().isEmpty() ) {
 			super.renderUpdateClause( updateStatement );
 		}
 		else {
@@ -178,6 +208,33 @@ public class MariaDBSqlAstTranslator<T extends JdbcOperation> extends SqlAstTran
 				|| !( getCurrentDmlStatement() instanceof InsertSelectStatement insertSelectStatement )
 				|| ( dmlAlias = insertSelectStatement.getTargetTable().getIdentificationVariable() ) == null
 				|| !dmlAlias.equals( columnReference.getQualifier() ) ) {
+
+			// For MariaDB < 11.1 with single-table DELETE/UPDATE, we need to handle correlations
+			// In single-table syntax, correlated subqueries reference the outer table implicitly
+			if ( getDialect().getVersion().isBefore( 11, 1 ) && !getQueryPartStack().isEmpty() ) {
+				final Statement currentDmlStatement = getCurrentDmlStatement();
+
+				// For DELETE statements with empty FROM clause (single-table syntax)
+				if ( currentDmlStatement instanceof DeleteStatement deleteStatement
+						&& deleteStatement.getFromClause().getRoots().isEmpty() ) {
+					final String targetAlias = deleteStatement.getTargetTable().getIdentificationVariable();
+					// If this column references the target table alias in a subquery, make it unqualified
+					// This allows correlation to work in single-table DELETE syntax
+					if ( targetAlias != null && targetAlias.equals( columnReference.getQualifier() ) ) {
+						return null; // Unqualified for implicit correlation
+					}
+				}
+				// For UPDATE statements with empty FROM clause (single-table syntax)
+				else if ( currentDmlStatement instanceof UpdateStatement updateStatement
+						&& updateStatement.getFromClause().getRoots().isEmpty() ) {
+					final String targetAlias = updateStatement.getTargetTable().getIdentificationVariable();
+					// If this column references the target table alias in a subquery, make it unqualified
+					if ( targetAlias != null && targetAlias.equals( columnReference.getQualifier() ) ) {
+						return null; // Unqualified for implicit correlation
+					}
+				}
+			}
+
 			return columnReference.getQualifier();
 		}
 		// Qualify the column reference with the table expression also when in subqueries
