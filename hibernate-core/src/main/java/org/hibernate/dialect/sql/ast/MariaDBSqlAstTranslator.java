@@ -210,7 +210,7 @@ public class MariaDBSqlAstTranslator<T extends JdbcOperation> extends SqlAstTran
 				|| !dmlAlias.equals( columnReference.getQualifier() ) ) {
 
 			// For MariaDB < 11.1 with single-table DELETE/UPDATE, we need to handle correlations
-			// In single-table syntax, correlated subqueries reference the outer table implicitly
+			// In single-table syntax, correlated subqueries must use table name (not alias) as qualifier
 			if ( getDialect().getVersion().isBefore( 11, 1 ) && !getQueryPartStack().isEmpty() ) {
 				final Statement currentDmlStatement = getCurrentDmlStatement();
 
@@ -218,19 +218,19 @@ public class MariaDBSqlAstTranslator<T extends JdbcOperation> extends SqlAstTran
 				if ( currentDmlStatement instanceof DeleteStatement deleteStatement
 						&& deleteStatement.getFromClause().getRoots().isEmpty() ) {
 					final String targetAlias = deleteStatement.getTargetTable().getIdentificationVariable();
-					// If this column references the target table alias in a subquery, make it unqualified
-					// This allows correlation to work in single-table DELETE syntax
+					// If this column references the target table alias in a subquery, use table expression instead
+					// This allows correlation to work: WHERE ... > EntityOfBasics.theInteger
 					if ( targetAlias != null && targetAlias.equals( columnReference.getQualifier() ) ) {
-						return null; // Unqualified for implicit correlation
+						return deleteStatement.getTargetTable().getTableExpression();
 					}
 				}
 				// For UPDATE statements with empty FROM clause (single-table syntax)
 				else if ( currentDmlStatement instanceof UpdateStatement updateStatement
 						&& updateStatement.getFromClause().getRoots().isEmpty() ) {
 					final String targetAlias = updateStatement.getTargetTable().getIdentificationVariable();
-					// If this column references the target table alias in a subquery, make it unqualified
+					// If this column references the target table alias in a subquery, use table expression instead
 					if ( targetAlias != null && targetAlias.equals( columnReference.getQualifier() ) ) {
-						return null; // Unqualified for implicit correlation
+						return updateStatement.getTargetTable().getTableExpression();
 					}
 				}
 			}
